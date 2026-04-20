@@ -2,7 +2,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <iostream>
-#include <set>
+#include <map>
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -14,49 +14,19 @@
 
 using namespace std;
 
+struct Conn {
+    int fd;
+    string read_buf;
+    string write_buf;
+};
+
 struct Request {
     string method;
     string url;
     string version;
 };
 string root = "html/";
-set<int> clients;
-
-string make_response(const string& status, const string& html) {
-    string res =
-        "HTTP/1.1 " + status + "\r\n"
-        "Content-Type: text/html; charset=UTF-8\r\n"
-        "Content-Length: " + to_string(html.size()) + "\r\n"
-        "Connection: close\r\n"
-        "\r\n" +
-        html;
-
-    return res;
-}
-
-Request parse_request_line(const string& msg) {
-    size_t pos = msg.find("\r\n");
-    if (pos == string::npos) return {"", "",""};
-
-    string line = msg.substr(0, pos);
-
-    string method, url, version;
-    stringstream ss(line);
-    ss >> method >> url >> version;
-
-    Request res = {method, url, version};
-    return res;
-}
-
-
-
-string read_file(const string& filename) {
-    ifstream fin(filename);
-    if(!fin.is_open()) return "";
-    stringstream buffer;
-    buffer << fin.rdbuf();
-    return buffer.str();
-}
+map<int, Conn> Conns;
 
 string make_time_page() {
     time_t now = time(nullptr);
@@ -85,20 +55,70 @@ string make_time_page() {
         "</html>";
 }
 
-pair<string, string> route(const string& url) {
-    if (url == "/" || url.empty()) {
-        return { "200 OK",read_file(root + "index.html")};
-    } else if (url == "/hello") {
-        return {"200 OK", read_file(root + "hello.html")};
-    } else if (url == "/time") {
-        return { "200 OK", make_time_page()};
-    } else {
-        return { "404 Not Found", read_file(root + "404.html")};
 
+string get_content_type(const string& url) {
+    if (url == "/time" || url == "/" || url.empty())
+        return "text/html; charset=UTF-8";
+    if (url.size() >= 5 && url.substr(url.size() - 5) == ".html")
+        return "text/html; charset=UTF-8";
+    if (url.size() >= 4 && url.substr(url.size() - 4) == ".css")
+        return "text/css; charset=UTF-8";
+    if (url.size() >= 3 && url.substr(url.size() - 3) == ".js")
+        return "application/javascript; charset=UTF-8";
+    return "text/plain; charset=UTF-8";
+}
+
+string make_response(const string& status, const string& type, const string& body) {
+    string res =
+        "HTTP/1.1 " + status + "\r\n"
+        "Content-Type: " + type + "\r\n"
+        "Content-Length: " + to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" +
+        body;
+    return res;
+}
+
+Request parse_request_line(const string& msg) {
+    size_t pos = msg.find("\r\n");
+    if (pos == string::npos) return {"", "",""};
+
+    string line = msg.substr(0, pos);
+
+    string method, url, version;
+    stringstream ss(line);
+    ss >> method >> url >> version;
+
+    Request res = {method, url, version};
+    return res;
+}
+
+string read_file(const string& filename) {
+    ifstream fin(filename);
+    if(!fin.is_open()) return "";
+    stringstream buffer;
+    buffer << fin.rdbuf();
+    return buffer.str();
+}
+
+string get_file_path(const string& url) {
+    if(url == "/" || url.empty()) return root + "index.html";
+    return root + url.substr(1);
+}
+
+pair<string, string> route(const string& url) {
+    if(url == "/time") return {"200 OK", make_time_page()};
+
+    string path = get_file_path(url);
+    string body = read_file(path);
+    
+    if(!body.empty()) {
+        return {"200 OK", body};
     }
 
-
+    return {"404 Not Found", read_file(root + "404.html")};
 }
+
 void set_nonblock(int fd) {
     int flag = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flag | O_NONBLOCK);
@@ -114,12 +134,13 @@ void ins(int fd, int epfd) {
         close(fd);
         return;
     }
-    clients.insert(fd);
+    Conns[fd] = {fd, "", ""};
+
 }
 
 void era(int fd, int epfd) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-    clients.erase(fd);
+    Conns.erase(fd);
     close(fd);
 }
 
@@ -137,13 +158,13 @@ void  handle_accept(int listenfd, int epfd) {
     cout << "client[" << clfd << "] connected" << endl;
 }
 
-bool read_request(int fd, string& req) {
+bool read_request(Conn& conn) {
     char buf[4096];
     while(1) {
-        int rn = recv(fd, buf, sizeof(buf), 0);
+        int rn = recv(conn.fd, buf, sizeof(buf), 0);
         if(rn > 0) {
-            req.append(buf, rn);
-            if(req.find("\r\n\r\n") != string::npos) {
+            conn.read_buf.append(buf, rn);
+            if(conn.read_buf.find("\r\n\r\n") != string::npos) {
                 return true;
             }
         }else if(rn == 0) {
@@ -155,12 +176,12 @@ bool read_request(int fd, string& req) {
             return false;
         }
     }
-    return req.find("\r\n\r\n") != string::npos;
+    return conn.read_buf.find("\r\n\r\n") != string::npos;
 }
 
 void handle_request(int fd, int epfd) {
-    string req;
-    bool ok = read_request(fd, req);
+    Conn& conn = Conns[fd];
+    bool ok = read_request(conn);
 
     if (!ok) {
         cout << "client[" << fd << "] disconnected" << endl;
@@ -169,26 +190,10 @@ void handle_request(int fd, int epfd) {
     }
 
     cout << "======= request from client[" << fd << "] =======" << endl;
-    cout << req << endl;
+    cout << conn.read_buf << endl;
     cout << "==============================================" << endl;
 
-    Request r = parse_request_line(req);
-    if (r.method.empty() || r.url.empty() || r.version.empty()) {
-        string body = "<h1>400 Bad Request</h1>";
-        string res = make_response("400 Bad Request", body);
-        send(fd, res.c_str(), res.size(), 0);
-        era(fd, epfd);
-        return;
-    }
-
-    if (r.method != "GET") {
-        string body = "<h1>405 Method Not Allowed</h1>";
-        string res = make_response("405 Method Not Allowed", body);
-        send(fd, res.c_str(), res.size(), 0);
-        era(fd, epfd);
-        return;
-    }
-
+    Request r = parse_request_line(conn.read_buf);
     cout << "parsed url: " << r.url << endl;
 
     auto [status, body] = route(r.url);
@@ -198,7 +203,12 @@ void handle_request(int fd, int epfd) {
         status = "500 Internal Server Error";
     }
 
-    string res = make_response(status, body);
+    string type = get_content_type(r.url);
+    if (status == "404 Not Found" || status == "500 Internal Server Error") {
+        type = "text/html; charset=UTF-8";
+    }
+
+    string res = make_response(status, type, body);
     send(fd, res.c_str(), res.size(), 0);
 
     era(fd, epfd);
