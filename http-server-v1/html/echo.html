@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>POST Echo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f8ff;
+            margin: 0;
+            padding: 36px 16px;
+        }
+        .card {
+            max-width: 760px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+            padding: 24px;
+        }
+        pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            background: #f1f4fb;
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid #d7dfef;
+        }
+        a {
+            display: inline-block;
+            margin-top: 14px;
+            text-decoration: none;
+            background: #1f7aec;
+            color: #fff;
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>POST Echo</h1>
+        <p>Server received the following body:</p>
+        <pre>{{BODY}}</pre>
+        <a href="/post.html">Back to POST Page</a>
+    </div>
+</body>
+</html>

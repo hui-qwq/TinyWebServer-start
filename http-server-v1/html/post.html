@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>POST Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f7ff;
+            margin: 0;
+            padding: 40px 16px;
+        }
+        .panel {
+            max-width: 680px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 14px;
+            padding: 24px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+        }
+        h1 {
+            margin-top: 0;
+        }
+        .hint {
+            color: #555;
+            margin-bottom: 18px;
+        }
+        label {
+            display: block;
+            margin: 14px 0 6px;
+            font-weight: 600;
+        }
+        input, textarea {
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid #cfd6e6;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 15px;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+        .row {
+            margin-top: 18px;
+        }
+        button, .back {
+            display: inline-block;
+            text-decoration: none;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 16px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        button {
+            background: #1f7aec;
+            color: #fff;
+            margin-right: 8px;
+        }
+        .back {
+            background: #e8edf9;
+            color: #1d2a4a;
+        }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>POST Test Page</h1>
+        <p class="hint">提交后会发送到 <code>/echo</code>，用于测试你的 POST 解析链路。</p>
+
+        <form method="POST" action="/echo">
+            <label for="title">Title</label>
+            <input id="title" name="title" type="text" placeholder="input title" />
+
+            <label for="content">Content</label>
+            <textarea id="content" name="content" placeholder="input content"></textarea>
+
+            <div class="row">
+                <button type="submit">Send POST</button>
+                <a class="back" href="/">Back Home</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>
