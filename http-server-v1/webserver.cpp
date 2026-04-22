@@ -1,4 +1,5 @@
 #include "webserver.hpp"
+#include "http_conn.hpp"
 
 #include <arpa/inet.h>
 #include <cassert>
@@ -159,6 +160,13 @@ void WebServer::handle_read(int fd) {
         return;
     }
 
+    if (st == IOState::TOO_LARGE) {
+        std::cout << "client[" << fd << "] memory exceeded" << std::endl;
+        it->second.set_413_response();
+        modfd(fd, EPOLLOUT | EPOLLRDHUP);
+        return;
+    }
+
     if (!it->second.process()) {
         close_conn(fd);
         return;
@@ -186,10 +194,27 @@ void WebServer::handle_write(int fd) {
         return;
     }
 
-    if (it->second.keep_alive()) {
+    const bool keep_alive = it->second.keep_alive();
+    std::cout << "[RES] fd=" << fd
+              << " method=" << it->second.last_method()
+              << " url=" << it->second.last_url()
+              << " status=" << it->second.last_status()
+              << " bytes=" << it->second.last_body_bytes()
+              << " conn=" << (keep_alive ? "keep-alive" : "close")
+              << std::endl;
+
+    if (keep_alive) {
         // keep-alive: 清理本次请求状态，回到读事件等待下一个请求
         it->second.reset_for_next_request();
-        modfd(fd, EPOLLIN | EPOLLRDHUP);
+
+        if(it->second.has_complete_request()) {
+            if(!it->second.process()) {
+                close_conn(fd);
+                return ;
+            }
+            modfd(fd, EPOLLOUT | EPOLLRDHUP);
+        }
+        else modfd(fd, EPOLLIN | EPOLLRDHUP);
         return;
     }
 

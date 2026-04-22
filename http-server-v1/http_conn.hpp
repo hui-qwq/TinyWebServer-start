@@ -7,7 +7,7 @@
 // 请求校验结果
 enum class VerifyResult { OK, BadRequest, NotAllowed };
 // 非阻塞 IO 的读写状态
-enum class IOState { READY, AGAIN, CLOSED, ERROR };
+enum class IOState { READY, AGAIN, CLOSED, ERROR, TOO_LARGE };
 
 struct Request {
     // 请求行：GET /index.html HTTP/1.1
@@ -37,9 +37,15 @@ public:
     IOState write();
     // 解析请求并生成响应
     bool process();
+    bool has_complete_request() const;
+    void set_413_response();
 
     int fd() const;
     bool keep_alive() const;
+    const std::string& last_method() const;
+    const std::string& last_url() const;
+    const std::string& last_status() const;
+    size_t last_body_bytes() const;
     void reset_for_next_request();
 
 private:
@@ -62,6 +68,11 @@ private:
     std::string get_file_path(const std::string& url) const;
     // 路由：动态接口或静态文件
     std::pair<std::string, std::string> route(const std::string& url) const;
+    // 统一设置错误响应
+    void set_error_response(const std::string& status,
+                            const std::string& html_file,
+                            const std::string& fallback_html,
+                            bool force_close);
     // 统一设置 400 响应
     void set_400_response();
     // 统一设置 405 响应
@@ -77,6 +88,11 @@ private:
     size_t bytes_sent_;
     // 当前请求是否启用 keep-alive
     bool keep_alive_;
+    // 最近一次请求/响应摘要，供统一日志输出
+    std::string last_method_;
+    std::string last_url_;
+    std::string last_status_;
+    size_t last_body_bytes_;
     // 站点根目录
     std::string root_;
 };

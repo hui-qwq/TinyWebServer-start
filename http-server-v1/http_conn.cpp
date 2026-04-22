@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -34,27 +35,53 @@ std::string html_escape(const std::string& s) {
 }
 }  // namespace
 
-HttpConn::HttpConn() : fd_(-1), bytes_sent_(0), keep_alive_(false), root_("html/") {}
+HttpConn::HttpConn()
+    : fd_(-1),
+      bytes_sent_(0),
+      keep_alive_(false),
+      last_body_bytes_(0),
+      root_("html/") {}
+
+void HttpConn::set_error_response(const std::string& status,
+                                  const std::string& html_file,
+                                  const std::string& fallback_html,
+                                  bool force_close) {
+    if (force_close) {
+        keep_alive_ = false;
+    }
+    std::string body;
+    if (!html_file.empty()) {
+        body = read_file(root_ + html_file);
+    }
+    if (body.empty()) {
+        body = fallback_html;
+    }
+    last_status_ = status;
+    last_body_bytes_ = body.size();
+    write_buf_ = make_response(status, "text/html; charset=UTF-8", body);
+    bytes_sent_ = 0;
+}
 
 void HttpConn::set_400_response() {
-    write_buf_ = make_response("400 Bad Request", "text/html; charset=UTF-8",
-                               "<h1>400 Bad Request</h1>");
-    bytes_sent_ = 0;
+    set_error_response("400 Bad Request", "400.html", "<h1>400 Bad Request</h1>", false);
 }
 
 void HttpConn::set_405_response() {
-    write_buf_ = make_response("405 Method Not Allowed", "text/html; charset=UTF-8",
-                               "<h1>405 Method Not Allowed</h1>");
-    bytes_sent_ = 0;
+    set_error_response("405 Method Not Allowed",
+                       "405.html",
+                       "<h1>405 Method Not Allowed</h1>",
+                       false);
 }
 
 void HttpConn::set_404_response() {
-    std::string body = read_file(root_ + "404.html");
-    if (body.empty()) {
-        body = "<h1>404 Not Found</h1>";
-    }
-    write_buf_ = make_response("404 Not Found", "text/html; charset=UTF-8", body);
-    bytes_sent_ = 0;
+    set_error_response("404 Not Found", "404.html", "<h1>404 Not Found</h1>", false);
+}
+
+void HttpConn::set_413_response() {
+    set_error_response("413 Payload Too Large",
+                       "413.html",
+                       "<h1>413 Payload Too Large</h1>",
+                       true);
 }
 
 
@@ -65,6 +92,10 @@ void HttpConn::init(int fd) {
     write_buf_.clear();
     bytes_sent_ = 0;
     keep_alive_ = false;
+    last_method_.clear();
+    last_url_.clear();
+    last_status_.clear();
+    last_body_bytes_ = 0;
 }
 
 // 连接关闭：关闭 fd 并复位状态
@@ -77,6 +108,10 @@ void HttpConn::close_conn() {
     write_buf_.clear();
     bytes_sent_ = 0;
     keep_alive_ = false;
+    last_method_.clear();
+    last_url_.clear();
+    last_status_.clear();
+    last_body_bytes_ = 0;
 }
 
 // 读取客户端请求：GET 读完整请求头，POST 读完整请求头 + body
@@ -86,13 +121,17 @@ IOState HttpConn::read_once() {
         ssize_t rn = recv(fd_, buf, sizeof(buf), 0);
         if (rn > 0) {
             read_buf_.append(buf, static_cast<size_t>(rn));
-
+            
             size_t header_end = read_buf_.find("\r\n\r\n");
             if (header_end == std::string::npos) {
+                if(read_buf_.size() > 8*1024) return IOState::TOO_LARGE;
                 continue;
+            }else if(header_end > 8*1024) {
+                return IOState::TOO_LARGE;
             }
-
             Request req = parse_request(read_buf_);
+            if(req.content_length > 1024*1024) return IOState::TOO_LARGE; 
+
             if (req.method == "POST") {
                 size_t body_start = header_end + 4;
                 if (read_buf_.size() < body_start + req.content_length) {
@@ -141,6 +180,8 @@ bool HttpConn::handle_post(Request& req) {
     if (pos != std::string::npos) {
         html.replace(pos, marker.size(), html_escape(req.body));
     }
+    last_status_ = "200 OK";
+    last_body_bytes_ = html.size();
     write_buf_ = make_response("200 OK", "text/html; charset=UTF-8", html);
     bytes_sent_ = 0;
     return true;
@@ -161,6 +202,8 @@ bool HttpConn::handle_get(Request& req) {
         type = "text/html; charset=UTF-8";
     }
 
+    last_status_ = status;
+    last_body_bytes_ = body.size();
     write_buf_ = make_response(status, type, body);
     bytes_sent_ = 0;
     return true;
@@ -170,6 +213,8 @@ bool HttpConn::handle_get(Request& req) {
 bool HttpConn::process() {
     Request req;
     VerifyResult res = validate_request(req);
+    last_method_ = req.method;
+    last_url_ = req.url;
 
     // 当前请求默认短连接，只有显式 keep-alive 才复用
     keep_alive_ = (req.connection == "keep-alive");
@@ -206,13 +251,42 @@ IOState HttpConn::write() {
     return IOState::READY;
 }
 
+bool HttpConn::has_complete_request() const {
+    size_t header_end = read_buf_.find("\r\n\r\n");
+    if(header_end == std::string::npos) return false;
+
+    Request req = parse_request(read_buf_);
+    size_t need = header_end + 4 + req.content_length; // GET时content_length=0
+    return read_buf_.size() >= need;
+}
+
 int HttpConn::fd() const { return fd_; }
 bool HttpConn::keep_alive() const { return keep_alive_; }
+const std::string& HttpConn::last_method() const { return last_method_; }
+const std::string& HttpConn::last_url() const { return last_url_; }
+const std::string& HttpConn::last_status() const { return last_status_; }
+size_t HttpConn::last_body_bytes() const { return last_body_bytes_; }
 void HttpConn::reset_for_next_request() {
-    read_buf_.clear();
+    size_t header_end = read_buf_.find("\r\n\r\n");
+    if(header_end == std::string::npos) read_buf_.clear();
+    else {
+        Request req = parse_request(read_buf_);
+        size_t len = std::min(header_end + req.content_length + 4, read_buf_.size());
+
+        std::cout << "[RESET] consumed=" << len
+          << " remain=" << read_buf_.size() - len << std::endl;
+
+        read_buf_.erase(0, len);
+
+    }
+
     write_buf_.clear();
     bytes_sent_ = 0;
     keep_alive_ = false;
+    last_method_.clear();
+    last_url_.clear();
+    last_status_.clear();
+    last_body_bytes_ = 0;
 }
 
 VerifyResult HttpConn::validate_request(Request& req) const {
@@ -364,9 +438,11 @@ std::string HttpConn::read_file(const std::string& filename) const {
 
 std::string HttpConn::get_file_path(const std::string& url) const {
     // / 默认映射到首页，其它路径按静态文件相对路径拼接
-    if (url == "/" || url.empty()) {
-        return root_ + "index.html";
+
+    if (url.empty() || url.find("..") != std::string::npos) {
+        return "";
     }
+    
     std::string rel = url.substr(1);
     if (rel.empty()) {
         return root_ + "index.html";
