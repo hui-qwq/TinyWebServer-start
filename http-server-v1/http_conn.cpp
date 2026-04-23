@@ -12,6 +12,9 @@
 #include <unistd.h>
 
 namespace {
+size_t HEADLIMIT = 8*1024;
+size_t BODYLIMIT = 1024*1024;
+
 std::string to_lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -49,6 +52,7 @@ void HttpConn::set_error_response(const std::string& status,
     if (force_close) {
         keep_alive_ = false;
     }
+
     std::string body;
     if (!html_file.empty()) {
         body = read_file(root_ + html_file);
@@ -56,6 +60,7 @@ void HttpConn::set_error_response(const std::string& status,
     if (body.empty()) {
         body = fallback_html;
     }
+    
     last_status_ = status;
     last_body_bytes_ = body.size();
     write_buf_ = make_response(status, "text/html; charset=UTF-8", body);
@@ -81,6 +86,13 @@ void HttpConn::set_413_response() {
     set_error_response("413 Payload Too Large",
                        "413.html",
                        "<h1>413 Payload Too Large</h1>",
+                       true);
+}
+
+void HttpConn::set_431_response() {
+    set_error_response("431 Request Header Fields Too Large",
+                       "431.html",
+                       "<h1>431 Request Header Fields Too Large</h1>",
                        true);
 }
 
@@ -124,13 +136,13 @@ IOState HttpConn::read_once() {
             
             size_t header_end = read_buf_.find("\r\n\r\n");
             if (header_end == std::string::npos) {
-                if(read_buf_.size() > 8*1024) return IOState::TOO_LARGE;
+                if(read_buf_.size() > HEADLIMIT) return IOState::HEAD_TOO_LARGE;
                 continue;
-            }else if(header_end > 8*1024) {
-                return IOState::TOO_LARGE;
+            }else if(header_end > HEADLIMIT) {
+                return IOState::HEAD_TOO_LARGE;
             }
             Request req = parse_request(read_buf_);
-            if(req.content_length > 1024*1024) return IOState::TOO_LARGE; 
+            if(req.content_length > BODYLIMIT) return IOState::BODY_TOO_LARGE; 
 
             if (req.method == "POST") {
                 size_t body_start = header_end + 4;
@@ -216,8 +228,12 @@ bool HttpConn::process() {
     last_method_ = req.method;
     last_url_ = req.url;
 
-    // 当前请求默认短连接，只有显式 keep-alive 才复用
-    keep_alive_ = (req.connection == "keep-alive");
+    // HTTP/1.1 默认 keep-alive，除非显式 close；HTTP/1.0 反之
+    if (req.version == "HTTP/1.1") {
+        keep_alive_ = (req.connection != "close");
+    } else {
+        keep_alive_ = (req.connection == "keep-alive");
+    }
 
     if (res == VerifyResult::BadRequest) {
         set_400_response();
@@ -251,14 +267,17 @@ IOState HttpConn::write() {
     return IOState::READY;
 }
 
+
 bool HttpConn::has_complete_request() const {
     size_t header_end = read_buf_.find("\r\n\r\n");
     if(header_end == std::string::npos) return false;
 
     Request req = parse_request(read_buf_);
-    size_t need = header_end + 4 + req.content_length; // GET时content_length=0
+    size_t body_start = header_end + 4;
+    size_t need = body_start + req.content_length; // GET时content_length=0
     return read_buf_.size() >= need;
 }
+
 
 int HttpConn::fd() const { return fd_; }
 bool HttpConn::keep_alive() const { return keep_alive_; }
@@ -266,12 +285,15 @@ const std::string& HttpConn::last_method() const { return last_method_; }
 const std::string& HttpConn::last_url() const { return last_url_; }
 const std::string& HttpConn::last_status() const { return last_status_; }
 size_t HttpConn::last_body_bytes() const { return last_body_bytes_; }
+
+
 void HttpConn::reset_for_next_request() {
     size_t header_end = read_buf_.find("\r\n\r\n");
     if(header_end == std::string::npos) read_buf_.clear();
     else {
         Request req = parse_request(read_buf_);
-        size_t len = std::min(header_end + req.content_length + 4, read_buf_.size());
+        size_t body_start = header_end + 4;
+        size_t len = std::min(body_start + req.content_length, read_buf_.size());
 
         std::cout << "[RESET] consumed=" << len
           << " remain=" << read_buf_.size() - len << std::endl;
@@ -333,12 +355,19 @@ Request HttpConn::parse_request(const std::string& msg) const {
 
     std::string request_line = msg.substr(0, line_end);
     std::stringstream rl(request_line);
-    rl >> req.method >> req.url >> req.version;
+    std::string extra;
+    
+    if (!(rl >> req.method >> req.url >> req.version) || (rl >> extra)) {
+        return Request{};
+    }
+
     if (req.method.empty() || req.url.empty() || req.version.empty()) {
         return Request{};
     }
 
     size_t cur = line_end + 2;
+    bool has_content_length = false;
+    size_t content_length_value = 0;
     while (cur < header_end) {
         size_t next = msg.find("\r\n", cur);
         if (next == std::string::npos || next > header_end) {
@@ -357,10 +386,17 @@ Request HttpConn::parse_request(const std::string& msg) const {
 
         std::string key = line.substr(0, colon);
         std::string value = line.substr(colon + 1);
+        if (key.empty()) {
+            return Request{};
+        }
 
         // 去掉 value 左侧空格
         while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
             value.erase(value.begin());
+        }
+        // 去掉 value 右侧空白
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
         }
         std::string key_lower = to_lower_copy(key);
         if (key_lower == "host") {
@@ -368,8 +404,22 @@ Request HttpConn::parse_request(const std::string& msg) const {
         } else if (key_lower == "connection") {
             req.connection = to_lower_copy(value);
         } else if(key_lower == "content-length") {
+            if (value.empty()) {
+                return Request{};
+            }
+            if (!std::all_of(value.begin(), value.end(),
+                             [](unsigned char c) { return std::isdigit(c) != 0; })) {
+                return Request{};
+            }
             try {
-                req.content_length = std::stoull(value);
+                unsigned long long parsed = std::stoull(value);
+                size_t parsed_len = static_cast<size_t>(parsed);
+                if (has_content_length && parsed_len != content_length_value) {
+                    return Request{};
+                }
+                has_content_length = true;
+                content_length_value = parsed_len;
+                req.content_length = parsed_len;
             } catch(...) {
                 return Request{};
             }

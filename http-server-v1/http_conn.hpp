@@ -7,7 +7,7 @@
 // 请求校验结果
 enum class VerifyResult { OK, BadRequest, NotAllowed };
 // 非阻塞 IO 的读写状态
-enum class IOState { READY, AGAIN, CLOSED, ERROR, TOO_LARGE };
+enum class IOState { READY, AGAIN, CLOSED, ERROR, HEAD_TOO_LARGE, BODY_TOO_LARGE};
 
 struct Request {
     // 请求行：GET /index.html HTTP/1.1
@@ -39,6 +39,7 @@ public:
     bool process();
     bool has_complete_request() const;
     void set_413_response();
+    void set_431_response();
 
     int fd() const;
     bool keep_alive() const;
@@ -79,6 +80,7 @@ private:
     void set_405_response();
     // 统一设置 404 响应
     void set_404_response();
+    
 
 private:
     int fd_;

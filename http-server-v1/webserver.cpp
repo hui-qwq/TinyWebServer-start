@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -33,15 +34,18 @@ WebServer::~WebServer() {
     }
 }
 
-void WebServer::init(int port) {
+bool WebServer::init(int port) {
     port_ = port;
-    event_listen();
+    return event_listen();
 }
 
-void WebServer::event_listen() {
+bool WebServer::event_listen() {
     // 1) 创建监听 socket
     listenfd_ = socket(AF_INET, SOCK_STREAM, 0);
-    assert(listenfd_ >= 0);
+    if(listenfd_ < 0) {
+        perror("socket failed");
+        return false;
+    }
 
     int on = 1;
     setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
@@ -52,8 +56,14 @@ void WebServer::event_listen() {
     server_addr.sin_port = htons(static_cast<uint16_t>(port_));
 
     // 2) 绑定端口并开始监听
-    assert(bind(listenfd_, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0);
-    assert(listen(listenfd_, 5) == 0);
+    if(bind(listenfd_, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) != 0) {
+        perror("bind failed");
+        return false;
+    }
+    if(listen(listenfd_, 5) != 0){
+        perror("listen failed");
+        return false;
+    }
 
     set_nonblock(listenfd_);
 
@@ -62,8 +72,8 @@ void WebServer::event_listen() {
     if (epfd_ < 0) {
         std::cerr << "epoll_create error" << std::endl;
         close(listenfd_);
-        listenfd_ = -1;
-        return;
+        perror("epoll create1 failed");
+        return false;
     }
 
     epoll_event ev{};
@@ -72,13 +82,13 @@ void WebServer::event_listen() {
     if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listenfd_, &ev) < 0) {
         std::cerr << "epoll_ctl add listenfd error" << std::endl;
         close(listenfd_);
-        listenfd_ = -1;
         close(epfd_);
-        epfd_ = -1;
-        return;
+        perror("listenfd add failed");
+        return false;
     }
 
     std::cout << "listening on " << port_ << "..." << std::endl;
+    return true;
 }
 
 // epoll 主循环：分发连接、读写、异常断开事件
@@ -90,6 +100,8 @@ void WebServer::run() {
     while (true) {
         int n = epoll_wait(epfd_, events_, 1024, -1);
         if (n < 0) {
+            if(errno == EINTR) continue;
+            perror("waiting error");
             break;
         }
 
@@ -160,11 +172,18 @@ void WebServer::handle_read(int fd) {
         return;
     }
 
-    if (st == IOState::TOO_LARGE) {
-        std::cout << "client[" << fd << "] memory exceeded" << std::endl;
-        it->second.set_413_response();
+    if (st == IOState::HEAD_TOO_LARGE) {
+        std::cout << "client[" << fd << "] head memory exceeded" << std::endl;
+        it->second.set_431_response();
         modfd(fd, EPOLLOUT | EPOLLRDHUP);
         return;
+    }
+
+    if(st == IOState::BODY_TOO_LARGE) {
+        std::cout << "client[" << fd << "] body memory exceeded" << std::endl;
+        it->second.set_413_response();
+        modfd(fd, EPOLLOUT | EPOLLRDHUP);
+        return ;
     }
 
     if (!it->second.process()) {

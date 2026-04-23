@@ -9,11 +9,11 @@ public:
     WebServer();
     ~WebServer();
 
-    void init(int port);
+    bool init(int port);
     void run();
 
 private:
-    void event_listen();
+    bool event_listen();
     void handle_accept();
     void handle_read(int fd);
     void handle_write(int fd);

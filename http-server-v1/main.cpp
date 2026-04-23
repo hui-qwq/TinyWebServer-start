@@ -2,7 +2,7 @@
 
 int main() {
     WebServer server;
-    server.init(8888);
+    if(!server.init(8888)) return 1;
     server.run();
     return 0;
 }
