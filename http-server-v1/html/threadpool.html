@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thread Pool Demo</title>
+    <style>
+        :root {
+            --bg: #f5f7fb;
+            --card: #ffffff;
+            --text: #1f2937;
+            --sub: #6b7280;
+            --ok: #16a34a;
+            --fail: #dc2626;
+            --btn: #15803d;
+            --btn-hover: #166534;
+            --line: #e5e7eb;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            color: var(--text);
+            background: radial-gradient(circle at 20% 0%, #eef6ff, var(--bg) 60%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+
+        .card {
+            width: min(900px, 100%);
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+            border: 1px solid #eef2f7;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 28px;
+        }
+
+        p {
+            margin: 0 0 18px;
+            color: var(--sub);
+            line-height: 1.5;
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(120px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+
+        label {
+            font-size: 14px;
+            color: #374151;
+            display: block;
+            margin-bottom: 6px;
+        }
+
+        input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            font-size: 15px;
+        }
+
+        .buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+
+        button, a.link-btn {
+            border: none;
+            border-radius: 10px;
+            padding: 11px 16px;
+            font-size: 14px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        button {
+            background: var(--btn);
+            color: #fff;
+        }
+
+        button:hover {
+            background: var(--btn-hover);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .secondary {
+            background: #e5e7eb;
+            color: #111827;
+        }
+
+        .secondary:hover {
+            background: #d1d5db;
+        }
+
+        a.link-btn {
+            background: #111827;
+            color: #fff;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(90px, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .stat {
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 12px;
+            background: #fafbfc;
+        }
+
+        .stat .k {
+            font-size: 12px;
+            color: var(--sub);
+        }
+
+        .stat .v {
+            margin-top: 4px;
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        .ok {
+            color: var(--ok);
+        }
+
+        .fail {
+            color: var(--fail);
+        }
+
+        .log {
+            width: 100%;
+            height: 170px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 10px;
+            font-family: Consolas, monospace;
+            font-size: 13px;
+            background: #0f172a;
+            color: #d1fae5;
+            overflow: auto;
+            white-space: pre-wrap;
+            line-height: 1.45;
+        }
+
+        @media (max-width: 760px) {
+            .row {
+                grid-template-columns: 1fr;
+            }
+
+            .stats {
+                grid-template-columns: repeat(2, minmax(100px, 1fr));
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Thread Pool Demo</h1>
+        <p>本页通过并发请求 <code>/hello.html</code> 来观察服务器线程池处理能力。每次点击“Start Test”都会发起一轮并发压测。</p>
+
+        <div class="row">
+            <div>
+                <label for="total">Total Requests</label>
+                <input id="total" type="number" min="1" max="20000" value="500">
+            </div>
+            <div>
+                <label for="concurrency">Concurrency</label>
+                <input id="concurrency" type="number" min="1" max="500" value="50">
+            </div>
+            <div>
+                <label for="path">Request Path</label>
+                <input id="path" type="text" value="/hello.html">
+            </div>
+        </div>
+
+        <div class="buttons">
+            <button id="startBtn">Start Test</button>
+            <button id="stopBtn" class="secondary" disabled>Stop</button>
+            <a class="link-btn" href="/">Back Home</a>
+        </div>
+
+        <div class="stats">
+            <div class="stat">
+                <div class="k">Done</div>
+                <div class="v" id="done">0</div>
+            </div>
+            <div class="stat">
+                <div class="k">Success</div>
+                <div class="v ok" id="ok">0</div>
+            </div>
+            <div class="stat">
+                <div class="k">Fail</div>
+                <div class="v fail" id="fail">0</div>
+            </div>
+            <div class="stat">
+                <div class="k">Avg Latency</div>
+                <div class="v" id="avg">0 ms</div>
+            </div>
+            <div class="stat">
+                <div class="k">RPS</div>
+                <div class="v" id="rps">0</div>
+            </div>
+        </div>
+
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        const doneEl = document.getElementById("done");
+        const okEl = document.getElementById("ok");
+        const failEl = document.getElementById("fail");
+        const avgEl = document.getElementById("avg");
+        const rpsEl = document.getElementById("rps");
+        const logEl = document.getElementById("log");
+        const totalInput = document.getElementById("total");
+        const concInput = document.getElementById("concurrency");
+        const pathInput = document.getElementById("path");
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
+
+        let stopFlag = false;
+
+        function log(line) {
+            const t = new Date().toLocaleTimeString();
+            logEl.textContent += "[" + t + "] " + line + "\n";
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function percentile(arr, p) {
+            if (arr.length === 0) return 0;
+            const sorted = [...arr].sort((a, b) => a - b);
+            const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+            return sorted[idx];
+        }
+
+        async function runLoadTest(total, concurrency, path) {
+            stopFlag = false;
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+
+            let nextId = 0;
+            let done = 0;
+            let ok = 0;
+            let fail = 0;
+            const latencies = [];
+            const startAt = performance.now();
+
+            doneEl.textContent = "0";
+            okEl.textContent = "0";
+            failEl.textContent = "0";
+            avgEl.textContent = "0 ms";
+            rpsEl.textContent = "0";
+            log("");
+            log("Start: total=" + total + ", concurrency=" + concurrency + ", path=" + path);
+
+            function refreshStats() {
+                const now = performance.now();
+                const elapsed = Math.max((now - startAt) / 1000, 0.001);
+                const avg = latencies.length ? (latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0;
+                doneEl.textContent = String(done);
+                okEl.textContent = String(ok);
+                failEl.textContent = String(fail);
+                avgEl.textContent = avg.toFixed(1) + " ms";
+                rpsEl.textContent = (done / elapsed).toFixed(1);
+            }
+
+            async function worker(workerId) {
+                while (!stopFlag) {
+                    const id = nextId;
+                    nextId += 1;
+                    if (id >= total) break;
+
+                    const t0 = performance.now();
+                    try {
+                        const res = await fetch(path, { cache: "no-store" });
+                        if (res.ok) ok += 1;
+                        else fail += 1;
+                    } catch (_) {
+                        fail += 1;
+                    }
+                    const dt = performance.now() - t0;
+                    latencies.push(dt);
+                    done += 1;
+
+                    if (done % 20 === 0 || done === total) {
+                        refreshStats();
+                    }
+                }
+                log("worker#" + workerId + " done");
+            }
+
+            const workers = [];
+            for (let i = 0; i < concurrency; i += 1) {
+                workers.push(worker(i + 1));
+            }
+
+            await Promise.all(workers);
+            refreshStats();
+
+            const elapsedMs = performance.now() - startAt;
+            const p95 = percentile(latencies, 0.95);
+            log("Finished: done=" + done +
+                ", ok=" + ok +
+                ", fail=" + fail +
+                ", elapsed=" + elapsedMs.toFixed(1) + "ms" +
+                ", p95=" + p95.toFixed(1) + "ms");
+
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
+        startBtn.addEventListener("click", async () => {
+            const total = Math.max(1, Number(totalInput.value || 500));
+            const concurrency = Math.max(1, Number(concInput.value || 50));
+            const path = (pathInput.value || "/hello.html").trim() || "/hello.html";
+            await runLoadTest(total, concurrency, path);
+        });
+
+        stopBtn.addEventListener("click", () => {
+            stopFlag = true;
+            stopBtn.disabled = true;
+            log("Stop requested.");
+        });
+    </script>
+</body>
+</html>

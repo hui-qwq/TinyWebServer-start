@@ -1,7 +1,7 @@
 CXX := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -O2
+CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -pthread
 TARGET := server
-SRCS := main.cpp webserver.cpp http_conn.cpp
+SRCS := main.cpp webserver.cpp http_conn.cpp thread_pool.cpp
 
 all: $(TARGET)
 

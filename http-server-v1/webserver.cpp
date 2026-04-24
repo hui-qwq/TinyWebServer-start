@@ -1,5 +1,6 @@
 #include "webserver.hpp"
 #include "http_conn.hpp"
+#include "thread_pool.hpp"
 
 #include <arpa/inet.h>
 #include <cassert>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <mutex>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -23,7 +25,9 @@ void set_nonblock(int fd) {
 }
 }  // namespace
 
-WebServer::WebServer() : port_(0), listenfd_(-1), epfd_(-1) {}
+WebServer::WebServer(size_t thread_count)
+    : port_(0), listenfd_(-1), epfd_(-1), pool_(thread_count, 10000) {}
+
 
 WebServer::~WebServer() {
     if (listenfd_ >= 0) {
@@ -35,7 +39,7 @@ WebServer::~WebServer() {
 }
 
 bool WebServer::init(int port) {
-    port_ = port;
+    port_ = port; 
     return event_listen();
 }
 
@@ -147,108 +151,141 @@ void WebServer::handle_accept() {
             close(clfd);
             continue;
         }
-
-        users_[clfd].init(clfd);
+        {
+            std::lock_guard<std::mutex> lock(users_mutex_);
+            users_[clfd].init(clfd);
+        }
         std::cout << "client[" << clfd << "] connected" << std::endl;
     }
 }
 
 // 读请求并构造响应，然后切到可写事件发送数据
 void WebServer::handle_read(int fd) {
-    auto it = users_.find(fd);
-    if (it == users_.end()) {
-        close_conn(fd);
-        return;
-    }
+    bool ok = pool_.enqueue([this, fd]() {
+        bool need_close = false;
+        bool need_mod_write = false;
 
-    IOState st = it->second.read_once();
-    if (st == IOState::CLOSED || st == IOState::ERROR) {
-        std::cout << "client[" << fd << "] disconnected" << std::endl;
-        close_conn(fd);
-        return;
-    }
-    if (st == IOState::AGAIN) {
-        std::cout << "client[" << fd << "] read AGAIN" << std::endl;
-        return;
-    }
-
-    if (st == IOState::HEAD_TOO_LARGE) {
-        std::cout << "client[" << fd << "] head memory exceeded" << std::endl;
-        it->second.set_431_response();
-        modfd(fd, EPOLLOUT | EPOLLRDHUP);
-        return;
-    }
-
-    if(st == IOState::BODY_TOO_LARGE) {
-        std::cout << "client[" << fd << "] body memory exceeded" << std::endl;
-        it->second.set_413_response();
-        modfd(fd, EPOLLOUT | EPOLLRDHUP);
-        return ;
-    }
-
-    if (!it->second.process()) {
-        close_conn(fd);
-        return;
-    }
-
-    modfd(fd, EPOLLOUT | EPOLLRDHUP);
-}
-
-void WebServer::handle_write(int fd) {
-    auto it = users_.find(fd);
-    if (it == users_.end()) {
-        close_conn(fd);
-        return;
-    }
-
-    auto st = it->second.write();
-    if (st == IOState::ERROR || st == IOState::CLOSED) {
-        std::cout << "client[" << fd << "] write ERROR/CLOSED" << std::endl;
-        close_conn(fd);
-        return;
-    }
-
-    if (st == IOState::AGAIN) {
-        // 等待下次可写事件继续发送
-        return;
-    }
-
-    const bool keep_alive = it->second.keep_alive();
-    std::cout << "[RES] fd=" << fd
-              << " method=" << it->second.last_method()
-              << " url=" << it->second.last_url()
-              << " status=" << it->second.last_status()
-              << " bytes=" << it->second.last_body_bytes()
-              << " conn=" << (keep_alive ? "keep-alive" : "close")
-              << std::endl;
-
-    if (keep_alive) {
-        // keep-alive: 清理本次请求状态，回到读事件等待下一个请求
-        it->second.reset_for_next_request();
-
-        if(it->second.has_complete_request()) {
-            if(!it->second.process()) {
-                close_conn(fd);
-                return ;
+        {
+            std::lock_guard<std::mutex> lock(users_mutex_);
+            auto it = users_.find(fd);
+            if (it == users_.end()) {
+                return;
             }
+
+            IOState st = it->second.read_once();
+            if (st == IOState::CLOSED || st == IOState::ERROR) {
+                need_close = true;
+            } else if (st == IOState::AGAIN) {
+                return;
+            } else if (st == IOState::HEAD_TOO_LARGE) {
+                it->second.set_431_response();
+                need_mod_write = true;
+            } else if (st == IOState::BODY_TOO_LARGE) {
+                it->second.set_413_response();
+                need_mod_write = true;
+            } else {
+                if (!it->second.process()) {
+                    need_close = true;
+                } else {
+                    need_mod_write = true;
+                }
+            }
+        }
+
+        if (need_close) {
+            close_conn(fd);
+            return;
+        }
+        if (need_mod_write) {
             modfd(fd, EPOLLOUT | EPOLLRDHUP);
         }
-        else modfd(fd, EPOLLIN | EPOLLRDHUP);
-        return;
+    });
+
+    if (!ok) {
+        std::cout << "thread pool full, close client[" << fd << "]" << std::endl;
+        close_conn(fd);
+    }
+}
+
+
+void WebServer::handle_write(int fd) {
+    bool need_close = false;
+    bool need_mod_read = false;
+    bool need_mod_write = false;
+
+    std::string method;
+    std::string url;
+    std::string status;
+    size_t body_bytes = 0;
+    bool keep_alive = false;
+
+    {
+        std::lock_guard<std::mutex> lock(users_mutex_);
+        auto it = users_.find(fd);
+        if (it == users_.end()) {
+            return;
+        }
+
+        auto st = it->second.write();
+        if (st == IOState::ERROR || st == IOState::CLOSED) {
+            need_close = true;
+        } else if (st == IOState::AGAIN) {
+            return;
+        } else {
+            keep_alive = it->second.keep_alive();
+            method = it->second.last_method();
+            url = it->second.last_url();
+            status = it->second.last_status();
+            body_bytes = it->second.last_body_bytes();
+
+            if (keep_alive) {
+                it->second.reset_for_next_request();
+
+                if (it->second.has_complete_request()) {
+                    if (!it->second.process()) {
+                        need_close = true;
+                    } else {
+                        need_mod_write = true;
+                    }
+                } else {
+                    need_mod_read = true;
+                }
+            } else {
+                need_close = true;
+            }
+        }
     }
 
-    close_conn(fd);
+    if (!status.empty()) {
+        std::cout << "[RES] fd=" << fd
+                  << " method=" << method
+                  << " url=" << url
+                  << " status=" << status
+                  << " bytes=" << body_bytes
+                  << " conn=" << (keep_alive ? "keep-alive" : "close")
+                  << std::endl;
+    }
+
+    if (need_close) {
+        close_conn(fd);
+        return;
+    }
+    if (need_mod_write) {
+        modfd(fd, EPOLLOUT | EPOLLRDHUP);
+    } else if (need_mod_read) {
+        modfd(fd, EPOLLIN | EPOLLRDHUP);
+    }
 }
+
 
 void WebServer::close_conn(int fd) {
     epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
 
+    std::lock_guard<std::mutex> lock(users_mutex_);
     auto it = users_.find(fd);
     if (it != users_.end()) {
         it->second.close_conn();
         users_.erase(it);
-    } else {
-        close(fd);
     }
 }
 
