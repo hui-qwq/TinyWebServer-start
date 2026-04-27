@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #fff6e8 0%, #f8fbff 52%, #eef8f1 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            color: #1f2a37;
+        }
+
+        .panel {
+            width: min(440px, 100%);
+            background: #ffffff;
+            border: 1px solid #ecedf1;
+            border-radius: 18px;
+            box-shadow: 0 14px 36px rgba(31, 42, 55, 0.12);
+            padding: 28px;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 30px;
+        }
+
+        .hint {
+            margin: 0 0 22px;
+            color: #667085;
+            line-height: 1.5;
+        }
+
+        label {
+            display: block;
+            margin: 14px 0 7px;
+            font-weight: 700;
+            color: #2f3b48;
+        }
+
+        input {
+            width: 100%;
+            border: 1px solid #ccd7e2;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #e68a2e;
+            box-shadow: 0 0 0 3px rgba(230, 138, 46, 0.14);
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            margin-top: 22px;
+        }
+
+        button, .link {
+            border: none;
+            border-radius: 10px;
+            padding: 11px 16px;
+            font-size: 15px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        button {
+            background: #e68a2e;
+            color: #ffffff;
+            font-weight: 700;
+        }
+
+        button:hover {
+            background: #c97322;
+        }
+
+        .link {
+            background: #edf2f7;
+            color: #334155;
+        }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>Register</h1>
+        <p class="hint">This page only provides the form. We will connect <code>POST /register</code> in C++ later.</p>
+
+        <form method="POST" action="/register">
+            <label for="username">Username</label>
+            <input id="username" name="username" type="text" placeholder="new_user" required>
+
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" placeholder="choose a password" required>
+
+            <div class="actions">
+                <button type="submit">Create Account</button>
+                <a class="link" href="/login">Go Login</a>
+                <a class="link" href="/">Back Home</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>

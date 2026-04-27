@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #eef8f1 0%, #f7fbff 55%, #fff8ec 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            color: #1f2a37;
+        }
+
+        .panel {
+            width: min(440px, 100%);
+            background: #ffffff;
+            border: 1px solid #e7edf3;
+            border-radius: 18px;
+            box-shadow: 0 14px 36px rgba(31, 42, 55, 0.12);
+            padding: 28px;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 30px;
+        }
+
+        .hint {
+            margin: 0 0 22px;
+            color: #607080;
+            line-height: 1.5;
+        }
+
+        label {
+            display: block;
+            margin: 14px 0 7px;
+            font-weight: 700;
+            color: #2f3b48;
+        }
+
+        input {
+            width: 100%;
+            border: 1px solid #ccd7e2;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #2f9e62;
+            box-shadow: 0 0 0 3px rgba(47, 158, 98, 0.14);
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 22px;
+        }
+
+        button, .back {
+            border: none;
+            border-radius: 10px;
+            padding: 11px 16px;
+            font-size: 15px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        button {
+            background: #2f9e62;
+            color: #ffffff;
+            font-weight: 700;
+        }
+
+        button:hover {
+            background: #23834f;
+        }
+
+        .back {
+            background: #edf2f7;
+            color: #334155;
+        }
+
+        code {
+            background: #f1f5f9;
+            border-radius: 6px;
+            padding: 2px 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>Login</h1>
+        <p class="hint">提交后浏览器会发送 <code>username=...&amp;password=...</code> 到 <code>/login</code>。</p>
+
+        <form method="POST" action="/login">
+            <label for="username">Username</label>
+            <input id="username" name="username" type="text" placeholder="tom" required>
+
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" placeholder="123456" required>
+
+            <div class="actions">
+                <button type="submit">Login</button>
+                <a class="back" href="/register">Register</a>
+                <a class="back" href="/">Back Home</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>

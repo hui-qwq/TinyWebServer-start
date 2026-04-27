@@ -52,6 +52,8 @@ public:
 private:
     bool handle_post(Request& req);
     bool handle_get(Request& req);
+    bool handle_register(Request& req);
+    bool handle_login(Request& req);
     // 解析请求行 + 部分请求头
     Request parse_request(const std::string& msg) const;
     // 校验请求合法性，并产出错误类型
@@ -74,6 +76,9 @@ private:
                             const std::string& html_file,
                             const std::string& fallback_html,
                             bool force_close);
+    // 统一设置一段 HTML 响应
+    void set_html_response(const std::string& status,
+                           const std::string& html);
     // 统一设置 400 响应
     void set_400_response();
     // 统一设置 405 响应

@@ -1,20 +1,23 @@
 #include "webserver.hpp"
-#include "http_conn.hpp"
-#include "thread_pool.hpp"
+#include "../http/http_conn.hpp"
+#include "../logger/logger.hpp"
+#include "../thread_pool/thread_pool.hpp"
 
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <mutex>
 #include <netinet/in.h>
+#include <sstream>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
+#include <vector>
 namespace {
 // 把 fd 设置为非阻塞，配合 epoll 边缘/水平触发都更稳妥
 void set_nonblock(int fd) {
@@ -25,8 +28,13 @@ void set_nonblock(int fd) {
 }
 }  // namespace
 
-WebServer::WebServer(size_t thread_count)
-    : port_(0), listenfd_(-1), epfd_(-1), pool_(thread_count, 10000) {}
+WebServer::WebServer(size_t thread_count, int idle_timeout_sec)
+    : port_(0),
+      listenfd_(-1),
+      epfd_(-1),
+      pool_(thread_count, 10000),
+      idle_timeout_sec_(idle_timeout_sec) 
+{}
 
 
 WebServer::~WebServer() {
@@ -47,7 +55,7 @@ bool WebServer::event_listen() {
     // 1) 创建监听 socket
     listenfd_ = socket(AF_INET, SOCK_STREAM, 0);
     if(listenfd_ < 0) {
-        perror("socket failed");
+        Logger::instance().error("socket failed: " + std::string(std::strerror(errno)));
         return false;
     }
 
@@ -61,11 +69,11 @@ bool WebServer::event_listen() {
 
     // 2) 绑定端口并开始监听
     if(bind(listenfd_, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) != 0) {
-        perror("bind failed");
+        Logger::instance().error("bind failed: " + std::string(std::strerror(errno)));
         return false;
     }
     if(listen(listenfd_, 5) != 0){
-        perror("listen failed");
+        Logger::instance().error("listen failed: " + std::string(std::strerror(errno)));
         return false;
     }
 
@@ -74,9 +82,8 @@ bool WebServer::event_listen() {
     // 3) 创建 epoll 并把监听 fd 加进去
     epfd_ = epoll_create1(0);
     if (epfd_ < 0) {
-        std::cerr << "epoll_create error" << std::endl;
         close(listenfd_);
-        perror("epoll create1 failed");
+        Logger::instance().error("epoll_create1 failed: " + std::string(std::strerror(errno)));
         return false;
     }
 
@@ -84,14 +91,13 @@ bool WebServer::event_listen() {
     ev.data.fd = listenfd_;
     ev.events = EPOLLIN;
     if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listenfd_, &ev) < 0) {
-        std::cerr << "epoll_ctl add listenfd error" << std::endl;
         close(listenfd_);
         close(epfd_);
-        perror("listenfd add failed");
+        Logger::instance().error("epoll_ctl add listenfd failed: " + std::string(std::strerror(errno)));
         return false;
     }
 
-    std::cout << "listening on " << port_ << "..." << std::endl;
+    Logger::instance().info("listening on " + std::to_string(port_) + "...");
     return true;
 }
 
@@ -102,12 +108,14 @@ void WebServer::run() {
     }
 
     while (true) {
-        int n = epoll_wait(epfd_, events_, 1024, -1);
+        int n = epoll_wait(epfd_, events_, 1024, 1000);
         if (n < 0) {
             if(errno == EINTR) continue;
-            perror("waiting error");
+            Logger::instance().error("epoll_wait failed: " + std::string(std::strerror(errno)));
             break;
         }
+
+        handle_timeout();
 
         for (int i = 0; i < n; i++) {
             int fd = events_[i].data.fd;
@@ -116,7 +124,7 @@ void WebServer::run() {
             if (fd == listenfd_) {
                 handle_accept();
             } else if (e & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                std::cout << "client[" << fd << "] disconnected" << std::endl;
+                Logger::instance().info("client[" + std::to_string(fd) + "] disconnected");
                 close_conn(fd);
             } else if (e & EPOLLIN) {
                 handle_read(fd);
@@ -124,6 +132,30 @@ void WebServer::run() {
                 handle_write(fd);
             }
         }
+
+    }
+}
+
+
+void WebServer::handle_timeout() {
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+
+    std::vector<int> to_close;
+    {
+        std::lock_guard<std::mutex> lock(users_mutex_);
+        to_close.reserve(last_active_.size());
+
+        for(const auto& kv : last_active_) {
+            int fd = kv.first;
+            const auto& tp = kv.second;
+            auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - tp).count();
+            if(idle > idle_timeout_sec_) to_close.push_back(fd);
+        }
+    }
+    for (int fd : to_close) {
+        Logger::instance().warn("client[" + std::to_string(fd) + "] timeout, close");
+        close_conn(fd);
     }
 }
 
@@ -137,7 +169,7 @@ void WebServer::handle_accept() {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-            std::cerr << "accept error" << std::endl;
+            Logger::instance().warn("accept failed: " + std::string(std::strerror(errno)));
             break;
         }
 
@@ -147,15 +179,16 @@ void WebServer::handle_accept() {
         ev.events = EPOLLIN | EPOLLRDHUP;
         ev.data.fd = clfd;
         if (epoll_ctl(epfd_, EPOLL_CTL_ADD, clfd, &ev) < 0) {
-            std::cerr << "epoll_ctl add error" << std::endl;
+            Logger::instance().warn("epoll_ctl add client fd failed: " + std::string(std::strerror(errno)));
             close(clfd);
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(users_mutex_);
             users_[clfd].init(clfd);
+            last_active_[clfd] = std::chrono::steady_clock::now();
         }
-        std::cout << "client[" << clfd << "] connected" << std::endl;
+        Logger::instance().info("client[" + std::to_string(clfd) + "] connected");
     }
 }
 
@@ -171,6 +204,7 @@ void WebServer::handle_read(int fd) {
             if (it == users_.end()) {
                 return;
             }
+            last_active_[fd] = std::chrono::steady_clock::now();
 
             IOState st = it->second.read_once();
             if (st == IOState::CLOSED || st == IOState::ERROR) {
@@ -202,7 +236,7 @@ void WebServer::handle_read(int fd) {
     });
 
     if (!ok) {
-        std::cout << "thread pool full, close client[" << fd << "]" << std::endl;
+        Logger::instance().warn("thread pool full, close client[" + std::to_string(fd) + "]");
         close_conn(fd);
     }
 }
@@ -225,6 +259,7 @@ void WebServer::handle_write(int fd) {
         if (it == users_.end()) {
             return;
         }
+        last_active_[fd] = std::chrono::steady_clock::now();
 
         auto st = it->second.write();
         if (st == IOState::ERROR || st == IOState::CLOSED) {
@@ -257,13 +292,14 @@ void WebServer::handle_write(int fd) {
     }
 
     if (!status.empty()) {
-        std::cout << "[RES] fd=" << fd
-                  << " method=" << method
-                  << " url=" << url
-                  << " status=" << status
-                  << " bytes=" << body_bytes
-                  << " conn=" << (keep_alive ? "keep-alive" : "close")
-                  << std::endl;
+        std::ostringstream oss;
+        oss << "[RES] fd=" << fd
+            << " method=" << method
+            << " url=" << url
+            << " status=" << status
+            << " bytes=" << body_bytes
+            << " conn=" << (keep_alive ? "keep-alive" : "close");
+        Logger::instance().info(oss.str());
     }
 
     if (need_close) {
@@ -287,6 +323,7 @@ void WebServer::close_conn(int fd) {
         it->second.close_conn();
         users_.erase(it);
     }
+    last_active_.erase(fd);
 }
 
 // 修改 fd 关注的事件（比如从读切到写）

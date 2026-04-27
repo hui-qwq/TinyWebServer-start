@@ -1,5 +1,4 @@
 #pragma once
-
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -23,7 +22,6 @@ public:
 
 private:
     void worker_loop();
-
 private:
     size_t max_tasks_;
     bool stopping_;
@@ -32,3 +30,4 @@ private:
     std::deque<Task> tasks_;
     std::vector<std::thread> workers_;
 };
+

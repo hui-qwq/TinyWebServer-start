@@ -1,14 +1,15 @@
 #pragma once
 
-#include "http_conn.hpp"
+#include "../http/http_conn.hpp"
 #include <sys/epoll.h>
 #include <unordered_map>
-#include "thread_pool.hpp"
+#include "../thread_pool/thread_pool.hpp"
+#include <chrono>
 #include <mutex>
 
 class WebServer {
 public:
-    explicit WebServer(size_t thread_count = 4);
+    explicit WebServer(size_t thread_count = 4, int idle_timeout_sec = 30);
     ~WebServer();
 
     bool init(int port);
@@ -17,11 +18,11 @@ public:
 private:
     bool event_listen();
     void handle_accept();
+    void handle_timeout();
     void handle_read(int fd);
     void handle_write(int fd);
     void close_conn(int fd);
     void modfd(int fd, int ev);
-
 private:
     int port_;
     int listenfd_;
@@ -30,4 +31,6 @@ private:
     std::mutex users_mutex_;
     epoll_event events_[1024];
     std::unordered_map<int, HttpConn> users_;
+    std::unordered_map<int, std::chrono::steady_clock::time_point> last_active_;
+    int idle_timeout_sec_;
 };

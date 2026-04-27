@@ -1,8 +1,9 @@
 #include "thread_pool.hpp"
+#include "../logger/logger.hpp"
 #include <cstddef>
 #include <mutex>
 
-ThreadPool::ThreadPool(size_t thread_count, size_t max_tasks){
+ThreadPool::ThreadPool(size_t thread_count, size_t max_tasks) {
     max_tasks_ = max_tasks;
     stopping_ = false;
     for(size_t i = 0; i < thread_count; ++ i) {
@@ -12,18 +13,22 @@ ThreadPool::ThreadPool(size_t thread_count, size_t max_tasks){
     }
 }
 
+
 ThreadPool::~ThreadPool() {
     shutdown();
 }
 
+
 bool ThreadPool::enqueue(Task task) {
     if(!task) return false;
-    
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
+
         if(stopping_ || tasks_.size() >= max_tasks_) {
             return false;
         }
+
         tasks_.emplace_back(std::move(task));
     }
 
@@ -31,18 +36,17 @@ bool ThreadPool::enqueue(Task task) {
     return true;
 }
 
+
 void ThreadPool::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if(stopping_) return;
-        stopping_  = true;
+        if(stopping_) return ;
+        stopping_ = true;
     }
 
-    cv_.notify_all();
-
-    for(auto& t : workers_) {
-        if(t.joinable()) {
-            t.join();
+    for(auto& it : workers_) {
+        if(it.joinable()) {
+            it.join();
         }
     }
 
@@ -59,7 +63,7 @@ void ThreadPool::worker_loop() {
             });
 
             if(stopping_ && tasks_.empty()) return ;
-
+            
             task = std::move(tasks_.front());
             tasks_.pop_front();
         }
@@ -67,7 +71,7 @@ void ThreadPool::worker_loop() {
         try {
             task();
         } catch(...) {
-            throw "task bug";
+            Logger::instance().error("thread pool task threw exception");
         }
     }
 }

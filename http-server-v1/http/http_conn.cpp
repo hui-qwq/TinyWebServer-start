@@ -1,4 +1,6 @@
 #include "http_conn.hpp"
+#include "auth.hpp"
+#include "../db/sql_connection_pool.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -6,10 +8,12 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <mysql/mysql.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+
 
 namespace {
 size_t HEADLIMIT = 8*1024;
@@ -17,7 +21,7 @@ size_t BODYLIMIT = 1024*1024;
 
 std::string to_lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
 
@@ -36,6 +40,9 @@ std::string html_escape(const std::string& s) {
     }
     return out;
 }
+
+
+
 }  // namespace
 
 HttpConn::HttpConn()
@@ -64,6 +71,14 @@ void HttpConn::set_error_response(const std::string& status,
     last_status_ = status;
     last_body_bytes_ = body.size();
     write_buf_ = make_response(status, "text/html; charset=UTF-8", body);
+    bytes_sent_ = 0;
+}
+
+void HttpConn::set_html_response(const std::string& status,
+                                 const std::string& html) {
+    last_status_ = status;
+    last_body_bytes_ = html.size();
+    write_buf_ = make_response(status, "text/html; charset=UTF-8", html);
     bytes_sent_ = 0;
 }
 
@@ -163,6 +178,62 @@ IOState HttpConn::read_once() {
     return IOState::AGAIN;
 }
 
+bool HttpConn::handle_register(Request& req) {
+    std::string username = get_form_value(req.body, "username");
+    std::string password = get_form_value(req.body, "password");
+    AuthResult res = register_user(username, password);
+    if (res == AuthResult::InvalidInput) {
+        set_html_response("400 Bad Request",
+                          "<h1>Register</h1><p>username or password empty</p>");
+        return true;
+    }
+
+    if (res == AuthResult::DatabaseError) {
+        set_html_response("500 Internal Server Error",
+                          "<h1>Register</h1><p>database connection unavailable</p>");
+        return true;
+    }
+
+    if (res == AuthResult::UserExists) {
+        set_html_response("200 OK",
+                            "<h1>Register</h1><p>username already exists</p>");
+            return true;
+    }
+
+    set_html_response("200 OK",
+                      "<h1>Register</h1><p>register success</p>"
+                      "<p><a href=\"/login\">Go Login</a></p>");
+    return true;
+}
+
+bool HttpConn::handle_login(Request& req) {
+    std::string username = get_form_value(req.body, "username");
+    std::string password = get_form_value(req.body, "password");
+
+    AuthResult res = login_user(username, password);
+    if (res == AuthResult::InvalidInput) {
+        set_html_response("400 Bad Request",
+                          "<h1>Login</h1><p>username or password empty</p>");
+        return true;
+    }
+
+    if (res == AuthResult::DatabaseError) {
+        set_html_response("500 Internal Server Error",
+                          "<h1>Login</h1><p>database connection unavailable</p>");
+        return true;
+    }
+
+    if (res == AuthResult::Success) {
+        set_html_response("200 OK",
+                          "<h1>Login</h1><p>login success</p>");
+    } else {
+        set_html_response("200 OK",
+                          "<h1>Login</h1><p>username or password wrong</p>");
+    }
+    return true;
+}
+
+
 bool HttpConn::handle_post(Request& req) {
     size_t header_end = read_buf_.find("\r\n\r\n");
     if (header_end == std::string::npos) {
@@ -178,10 +249,19 @@ bool HttpConn::handle_post(Request& req) {
 
     req.body = read_buf_.substr(body_start, req.content_length);
 
+    if (req.url == "/register") {
+        return handle_register(req);
+    }
+
+    if (req.url == "/login") {
+        return handle_login(req);
+    }
+
     if (req.url != "/echo") {
         set_404_response();
         return true;
     }
+
 
     std::string html = read_file(root_ + "echo.html");
     if (html.empty()) {
