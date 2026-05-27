@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{HEADING}} - Blog</title>
+    <link rel="stylesheet" href="/blog/blog.css">
+    <script src="/marked.min.js"></script>
+</head>
+<body>
+    <nav class="topbar">
+        <a href="/" class="logo">My Blog</a>
+        <div class="nav-links">
+            <a href="/blog">Articles</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <h1>{{HEADING}}</h1>
+
+        <form method="POST" action="{{FORM_ACTION}}" class="editor-form">
+            <input id="title" name="title" type="text"
+                   placeholder="Article title" value="{{TITLE_VALUE}}" required>
+
+            <input id="category" name="category" type="text"
+                   placeholder="Category (optional)" value="{{CATEGORY_VALUE}}">
+
+            <div class="editor-layout">
+                <div class="editor-pane">
+                    <label for="editor">Markdown</label>
+                    <textarea id="editor" name="content"
+                              placeholder="Write your article in Markdown..." required>{{CONTENT_VALUE}}</textarea>
+                </div>
+                <div class="editor-pane">
+                    <label>Preview</label>
+                    <div id="preview" class="preview"></div>
+                </div>
+            </div>
+
+            <div class="editor-actions">
+                <button type="submit" class="btn-publish">Publish</button>
+                <a href="/blog" class="btn-cancel">Cancel</a>
+                {{DELETE_HTML}}
+            </div>
+        </form>
+    </main>
+
+    <script src="/blog/blog.js"></script>
+</body>
+</html>

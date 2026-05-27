@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 // 请求校验结果
@@ -42,6 +44,7 @@ public:
     void set_431_response();
 
     int fd() const;
+    uint64_t generation() const { return gen_; }
     bool keep_alive() const;
     const std::string& last_method() const;
     const std::string& last_url() const;
@@ -54,6 +57,16 @@ private:
     bool handle_get(Request& req);
     bool handle_register(Request& req);
     bool handle_login(Request& req);
+    bool handle_blog_get(const Request& req);
+    bool handle_blog_post(Request& req);
+    int get_session_user_id() const;
+    bool handle_blog_list();
+    bool handle_blog_detail(int id);
+    bool handle_blog_new_page();
+    bool handle_blog_create(Request& req);
+    bool handle_blog_edit_page(int id);
+    bool handle_blog_update(int id, Request& req);
+    bool handle_blog_delete(int id);
     // 解析请求行 + 部分请求头
     Request parse_request(const std::string& msg) const;
     // 校验请求合法性，并产出错误类型
@@ -61,7 +74,8 @@ private:
     // 组装 HTTP 响应报文
     std::string make_response(const std::string& status,
                               const std::string& type,
-                              const std::string& body) const;
+                              const std::string& body,
+                              const std::string& set_cookie = "") const;
 
     // 按 URL 扩展名推断 Content-Type
     std::string get_content_type(const std::string& url) const;
@@ -89,6 +103,7 @@ private:
 
 private:
     int fd_;
+    uint64_t gen_ = 0;
     std::string read_buf_;
     std::string write_buf_;
     // 已发送字节数，用于处理分段发送
@@ -102,4 +117,8 @@ private:
     size_t last_body_bytes_;
     // 站点根目录
     std::string root_;
+
+    // 静态文件缓存：路径 → 文件内容
+    static std::unordered_map<std::string, std::string> file_cache_;
+    static std::mutex file_cache_mutex_;
 };

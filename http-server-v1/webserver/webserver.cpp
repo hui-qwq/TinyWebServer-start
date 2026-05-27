@@ -194,16 +194,25 @@ void WebServer::handle_accept() {
 
 // 读请求并构造响应，然后切到可写事件发送数据
 void WebServer::handle_read(int fd) {
-    bool ok = pool_.enqueue([this, fd]() {
+    // 短暂持锁获取 generation，用于任务执行时校验 fd 未被复用
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lock(users_mutex_);
+        auto it = users_.find(fd);
+        if (it == users_.end()) return;
+        gen = it->second.generation();
+    }
+
+    bool ok = pool_.enqueue([this, fd, gen]() {
         bool need_close = false;
         bool need_mod_write = false;
 
         {
             std::lock_guard<std::mutex> lock(users_mutex_);
             auto it = users_.find(fd);
-            if (it == users_.end()) {
-                return;
-            }
+            if (it == users_.end()) return;
+            if (it->second.generation() != gen) return;  // fd 已复用给新连接
+
             last_active_[fd] = std::chrono::steady_clock::now();
 
             IOState st = it->second.read_once();
@@ -246,6 +255,8 @@ void WebServer::handle_write(int fd) {
     bool need_close = false;
     bool need_mod_read = false;
     bool need_mod_write = false;
+    bool need_enqueue_pipeline = false;
+    uint64_t gen = 0;
 
     std::string method;
     std::string url;
@@ -272,16 +283,13 @@ void WebServer::handle_write(int fd) {
             url = it->second.last_url();
             status = it->second.last_status();
             body_bytes = it->second.last_body_bytes();
+            gen = it->second.generation();
 
             if (keep_alive) {
                 it->second.reset_for_next_request();
 
                 if (it->second.has_complete_request()) {
-                    if (!it->second.process()) {
-                        need_close = true;
-                    } else {
-                        need_mod_write = true;
-                    }
+                    need_enqueue_pipeline = true;  // 锁外入队
                 } else {
                     need_mod_read = true;
                 }
@@ -300,6 +308,34 @@ void WebServer::handle_write(int fd) {
             << " bytes=" << body_bytes
             << " conn=" << (keep_alive ? "keep-alive" : "close");
         Logger::instance().info(oss.str());
+    }
+
+    if (need_enqueue_pipeline) {
+        bool ok = pool_.enqueue([this, fd, gen]() {
+            bool need_close_local = false;
+            bool need_mod_write_local = false;
+            {
+                std::lock_guard<std::mutex> lock(users_mutex_);
+                auto it = users_.find(fd);
+                if (it == users_.end()) return;
+                if (it->second.generation() != gen) return;  // fd 已复用给新连接
+                last_active_[fd] = std::chrono::steady_clock::now();
+
+                if (!it->second.process()) {
+                    need_close_local = true;
+                } else {
+                    need_mod_write_local = true;
+                }
+            }
+            if (need_close_local) close_conn(fd);
+            if (need_mod_write_local) modfd(fd, EPOLLOUT | EPOLLRDHUP);
+        });
+
+        if (!ok) {
+            Logger::instance().warn("thread pool full (pipeline), close client[" + std::to_string(fd) + "]");
+            close_conn(fd);
+            return;
+        }
     }
 
     if (need_close) {

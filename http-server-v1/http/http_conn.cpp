@@ -1,11 +1,13 @@
 #include "http_conn.hpp"
 #include "auth.hpp"
+#include "template.hpp"
 #include "../db/sql_connection_pool.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <mysql/mysql.h>
@@ -25,25 +27,46 @@ std::string to_lower_copy(std::string s) {
     return s;
 }
 
-std::string html_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '&': out += "&amp;"; break;
-            case '<': out += "&lt;"; break;
-            case '>': out += "&gt;"; break;
-            case '"': out += "&quot;"; break;
-            case '\'': out += "&#39;"; break;
-            default: out.push_back(c); break;
-        }
-    }
-    return out;
-}
-
-
 
 }  // namespace
+
+// 从请求头中提取 Content-Length 值，只扫描不构建 Request 结构体
+static size_t extract_content_length(const std::string& buf, size_t header_end) {
+    size_t pos = 0;
+    while (pos < header_end) {
+        size_t line_end = buf.find("\r\n", pos);
+        if (line_end == std::string::npos || line_end > header_end) break;
+
+        std::string line = buf.substr(pos, line_end - pos);
+        if (line.empty()) { pos = line_end + 2; continue; }
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) { pos = line_end + 2; continue; }
+
+        std::string key = line.substr(0, colon);
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (key == "content-length") {
+            std::string val = line.substr(colon + 1);
+            while (!val.empty() && (val[0] == ' ' || val[0] == '\t'))
+                val.erase(val.begin());
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\t'))
+                val.pop_back();
+
+            if (!val.empty() && std::all_of(val.begin(), val.end(), ::isdigit)) {
+                try { return std::stoull(val); }
+                catch (...) { return 0; }
+            }
+        }
+        pos = line_end + 2;
+    }
+    return 0;
+}
+
+// 静态文件缓存的存储定义
+std::unordered_map<std::string, std::string> HttpConn::file_cache_;
+std::mutex HttpConn::file_cache_mutex_;
 
 HttpConn::HttpConn()
     : fd_(-1),
@@ -115,6 +138,7 @@ void HttpConn::set_431_response() {
 // 连接初始化：挂载 fd 并清空读写状态
 void HttpConn::init(int fd) {
     fd_ = fd;
+    gen_++;
     read_buf_.clear();
     write_buf_.clear();
     bytes_sent_ = 0;
@@ -210,7 +234,8 @@ bool HttpConn::handle_login(Request& req) {
     std::string username = get_form_value(req.body, "username");
     std::string password = get_form_value(req.body, "password");
 
-    AuthResult res = login_user(username, password);
+    int user_id = 0;
+    AuthResult res = login_user(username, password, &user_id);
     if (res == AuthResult::InvalidInput) {
         set_html_response("400 Bad Request",
                           "<h1>Login</h1><p>username or password empty</p>");
@@ -224,8 +249,25 @@ bool HttpConn::handle_login(Request& req) {
     }
 
     if (res == AuthResult::Success) {
-        set_html_response("200 OK",
-                          "<h1>Login</h1><p>login success</p>");
+        std::string token = generate_token();
+        {
+            Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+            MYSQL* conn = guard.get();
+            if (conn) {
+                std::string sql =
+                    "INSERT INTO sessions (user_id, token) VALUES ("
+                    + std::to_string(user_id) + ", '" + token + "')";
+                mysql_query(conn, sql.c_str());
+            }
+        }
+
+        std::string cookie = "session_token=" + token + "; HttpOnly; Path=/";
+        std::string body = "<h1>Login</h1><p>login success</p>"
+                           "<p><a href=\"/blog\">Go to Blog</a></p>";
+        last_status_ = "200 OK";
+        last_body_bytes_ = body.size();
+        write_buf_ = make_response("200 OK", "text/html; charset=UTF-8", body, cookie);
+        bytes_sent_ = 0;
     } else {
         set_html_response("200 OK",
                           "<h1>Login</h1><p>username or password wrong</p>");
@@ -248,6 +290,10 @@ bool HttpConn::handle_post(Request& req) {
     }
 
     req.body = read_buf_.substr(body_start, req.content_length);
+
+    if (req.url.find("/blog") == 0) {
+        return handle_blog_post(req);
+    }
 
     if (req.url == "/register") {
         return handle_register(req);
@@ -279,9 +325,497 @@ bool HttpConn::handle_post(Request& req) {
     return true;
 }
 
+int HttpConn::get_session_user_id() const {
+    size_t header_end = read_buf_.find("\r\n\r\n");
+    if (header_end == std::string::npos) return 0;
+
+    size_t cookie_pos = read_buf_.find("Cookie: ");
+    if (cookie_pos == std::string::npos || cookie_pos >= header_end) return 0;
+
+    cookie_pos += 8;
+    size_t cookie_end = read_buf_.find("\r\n", cookie_pos);
+    if (cookie_end == std::string::npos || cookie_end > header_end) return 0;
+
+    std::string cookie_line = read_buf_.substr(cookie_pos, cookie_end - cookie_pos);
+    const std::string key = "session_token=";
+    size_t key_pos = cookie_line.find(key);
+    if (key_pos == std::string::npos) return 0;
+
+    size_t val_start = key_pos + key.size();
+    size_t val_end = cookie_line.find(';', val_start);
+    if (val_end == std::string::npos) val_end = cookie_line.size();
+    std::string token = cookie_line.substr(val_start, val_end - val_start);
+    if (token.empty()) return 0;
+
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+    if (!conn) return 0;
+
+    const char* sql = "SELECT user_id FROM sessions WHERE token = ?";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt) return 0;
+    if (mysql_stmt_prepare(stmt, sql, std::strlen(sql)) != 0) {
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    MYSQL_BIND bind[1];
+    std::memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void*)token.c_str();
+    bind[0].buffer_length = token.size();
+    mysql_stmt_bind_param(stmt, bind);
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    int user_id = 0;
+    MYSQL_BIND result[1];
+    std::memset(result, 0, sizeof(result));
+    result[0].buffer_type = MYSQL_TYPE_LONG;
+    result[0].buffer = &user_id;
+    mysql_stmt_bind_result(stmt, result);
+
+    int fetch_ret = mysql_stmt_fetch(stmt);
+    mysql_stmt_close(stmt);
+    return (fetch_ret == 0) ? user_id : 0;
+}
+
+// ---------- Blog handlers ----------
+
+bool HttpConn::handle_blog_list() {
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+
+    std::string items;
+    if (conn) {
+        const char* sql =
+            "SELECT id, title, category, DATE_FORMAT(created_at, '%Y-%m-%d') "
+            "FROM articles WHERE is_published=1 ORDER BY id DESC LIMIT 50";
+        if (mysql_query(conn, sql) == 0) {
+            MYSQL_RES* res = mysql_store_result(conn);
+            if (res) {
+                MYSQL_ROW row;
+                while ((row = mysql_fetch_row(res))) {
+                    std::string id    = row[0] ? row[0] : "";
+                    std::string title = row[1] ? row[1] : "";
+                    std::string cat   = row[2] ? row[2] : "";
+                    std::string date  = row[3] ? row[3] : "";
+
+                    items += "<article class=\"post-item\">"
+                             "<h2><a href=\"/blog/" + id + "\">" + html_escape(title) + "</a></h2>"
+                             "<div class=\"post-meta\">"
+                             "<span>" + date + "</span>";
+                    if (!cat.empty()) {
+                        items += " <span class=\"post-category\">" + html_escape(cat) + "</span>";
+                    }
+                    items += "</div></article>\n";
+                }
+                mysql_free_result(res);
+            }
+        }
+    }
+
+    if (items.empty()) {
+        items = "<p class=\"empty\">还没有文章，<a href=\"/blog/new\">写一篇</a>吧。</p>";
+    }
+
+    std::string html = read_file(root_ + "blog/list.html");
+    if (html.empty()) html = "<h1>Blog</h1>" + items;
+    replace_placeholder(html, "ARTICLES", items);
+
+    set_html_response("200 OK", html);
+    return true;
+}
+
+bool HttpConn::handle_blog_detail(int id) {
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+
+    std::string title, content, date_str, category;
+    if (conn) {
+        std::string sql_str =
+            "SELECT title, content, category, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') "
+            "FROM articles WHERE id = " + std::to_string(id);
+        if (mysql_query(conn, sql_str.c_str()) == 0) {
+            MYSQL_RES* res = mysql_store_result(conn);
+            if (res) {
+                MYSQL_ROW row = mysql_fetch_row(res);
+                if (row) {
+                    title    = row[0] ? row[0] : "";
+                    content  = row[1] ? row[1] : "";
+                    category = row[2] ? row[2] : "";
+                    date_str = row[3] ? row[3] : "";
+                }
+                mysql_free_result(res);
+            }
+        }
+    }
+
+    if (title.empty() && content.empty()) {
+        set_404_response();
+        return true;
+    }
+
+    std::string html = read_file(root_ + "blog/detail.html");
+    if (html.empty()) {
+        set_html_response("200 OK", "<h1>" + html_escape(title) + "</h1><pre>" + html_escape(content) + "</pre>");
+        return true;
+    }
+
+    replace_placeholder(html, "TITLE", html_escape(title));
+    replace_placeholder(html, "CONTENT_JSON", escape_json(content));
+    replace_placeholder(html, "DATE", date_str);
+    replace_placeholder(html, "CATEGORY", html_escape(category));
+    replace_placeholder(html, "ID", std::to_string(id));
+
+    set_html_response("200 OK", html);
+    return true;
+}
+
+bool HttpConn::handle_blog_new_page() {
+    int user_id = get_session_user_id();
+    if (user_id == 0) {
+        set_html_response("200 OK",
+            "<h1>Blog</h1><p>请先<a href=\"/login\">登录</a>后再写文章。</p>"
+            "<p><a href=\"/blog\">返回列表</a></p>");
+        return true;
+    }
+
+    std::string html = read_file(root_ + "blog/editor.html");
+    if (html.empty()) {
+        html = "<h1>New Article</h1>"
+               "<form method=\"POST\" action=\"/blog\">"
+               "<input name=\"title\" placeholder=\"Title\" required>"
+               "<textarea name=\"content\" placeholder=\"Markdown...\" required></textarea>"
+               "<button type=\"submit\">Publish</button></form>";
+    } else {
+        replace_placeholder(html, "HEADING", "New Article");
+        replace_placeholder(html, "FORM_ACTION", "/blog");
+        replace_placeholder(html, "TITLE_VALUE", "");
+        replace_placeholder(html, "CONTENT_VALUE", "");
+        replace_placeholder(html, "CATEGORY_VALUE", "");
+        replace_placeholder(html, "DELETE_HTML", "");
+        replace_placeholder(html, "ID", "");
+    }
+
+    set_html_response("200 OK", html);
+    return true;
+}
+
+bool HttpConn::handle_blog_create(Request& req) {
+    int user_id = get_session_user_id();
+    if (user_id == 0) {
+        std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+        write_buf_ =
+            "HTTP/1.1 302 Found\r\n"
+            "Location: /login\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: " + conn_str + "\r\n\r\n";
+        bytes_sent_ = 0;
+        last_status_ = "302 Found";
+        last_body_bytes_ = 0;
+        return true;
+    }
+
+    std::string title    = url_decode(get_form_value(req.body, "title"));
+    std::string content  = url_decode(get_form_value(req.body, "content"));
+    std::string category = url_decode(get_form_value(req.body, "category"));
+
+    if (title.empty() || content.empty()) {
+        set_html_response("400 Bad Request", "<h1>Error</h1><p>Title and content are required.</p>");
+        return true;
+    }
+
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+    if (!conn) {
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database unavailable.</p>");
+        return true;
+    }
+
+    const char* sql = "INSERT INTO articles (title, content, category) VALUES (?, ?, ?)";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt) {
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database error.</p>");
+        return true;
+    }
+    if (mysql_stmt_prepare(stmt, sql, std::strlen(sql)) != 0) {
+        mysql_stmt_close(stmt);
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database error.</p>");
+        return true;
+    }
+
+    MYSQL_BIND bind[3];
+    std::memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void*)title.c_str();
+    bind[0].buffer_length = title.size();
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (void*)content.c_str();
+    bind[1].buffer_length = content.size();
+    bind[2].buffer_type = MYSQL_TYPE_STRING;
+    bind[2].buffer = (void*)category.c_str();
+    bind[2].buffer_length = category.size();
+    mysql_stmt_bind_param(stmt, bind);
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Failed to create article.</p>");
+        return true;
+    }
+    mysql_stmt_close(stmt);
+
+    std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+    write_buf_ =
+        "HTTP/1.1 302 Found\r\n"
+        "Location: /blog\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: " + conn_str + "\r\n\r\n";
+    bytes_sent_ = 0;
+    last_status_ = "302 Found";
+    last_body_bytes_ = 0;
+    return true;
+}
+
+bool HttpConn::handle_blog_edit_page(int id) {
+    int user_id = get_session_user_id();
+    if (user_id == 0) {
+        set_html_response("200 OK",
+            "<h1>Blog</h1><p>请先<a href=\"/login\">登录</a>后再编辑。</p>");
+        return true;
+    }
+
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+
+    std::string title, content, category;
+    if (conn) {
+        std::string sql_str =
+            "SELECT title, content, category FROM articles WHERE id = " + std::to_string(id);
+        if (mysql_query(conn, sql_str.c_str()) == 0) {
+            MYSQL_RES* res = mysql_store_result(conn);
+            if (res) {
+                MYSQL_ROW row = mysql_fetch_row(res);
+                if (row) {
+                    title    = row[0] ? row[0] : "";
+                    content  = row[1] ? row[1] : "";
+                    category = row[2] ? row[2] : "";
+                }
+                mysql_free_result(res);
+            }
+        }
+    }
+
+    if (title.empty() && content.empty()) {
+        set_404_response();
+        return true;
+    }
+
+    std::string html = read_file(root_ + "blog/editor.html");
+    if (html.empty()) {
+        set_html_response("200 OK", "<h1>Edit</h1><p>Editor template not found.</p>");
+        return true;
+    }
+
+    replace_placeholder(html, "HEADING", "Edit Article");
+    replace_placeholder(html, "FORM_ACTION", "/blog/" + std::to_string(id) + "/edit");
+    replace_placeholder(html, "TITLE_VALUE", html_escape(title));
+    replace_placeholder(html, "CONTENT_VALUE", html_escape(content));
+    replace_placeholder(html, "CATEGORY_VALUE", html_escape(category));
+    replace_placeholder(html, "ID", std::to_string(id));
+
+    std::string delete_html =
+        "<form method=\"POST\" action=\"/blog/" + std::to_string(id) + "/delete\" "
+        "onsubmit=\"return confirm('Delete this article?')\" style=\"display:inline;\">"
+        "<button type=\"submit\" class=\"btn-delete\">Delete</button></form>";
+    replace_placeholder(html, "DELETE_HTML", delete_html);
+
+    set_html_response("200 OK", html);
+    return true;
+}
+
+bool HttpConn::handle_blog_update(int id, Request& req) {
+    int user_id = get_session_user_id();
+    if (user_id == 0) {
+        std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+        write_buf_ =
+            "HTTP/1.1 302 Found\r\n"
+            "Location: /login\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: " + conn_str + "\r\n\r\n";
+        bytes_sent_ = 0;
+        last_status_ = "302 Found";
+        last_body_bytes_ = 0;
+        return true;
+    }
+
+    std::string title    = url_decode(get_form_value(req.body, "title"));
+    std::string content  = url_decode(get_form_value(req.body, "content"));
+    std::string category = url_decode(get_form_value(req.body, "category"));
+
+    if (title.empty() || content.empty()) {
+        set_html_response("400 Bad Request", "<h1>Error</h1><p>Title and content are required.</p>");
+        return true;
+    }
+
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+    if (!conn) {
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database unavailable.</p>");
+        return true;
+    }
+
+    const char* sql = "UPDATE articles SET title=?, content=?, category=? WHERE id=?";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt) {
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database error.</p>");
+        return true;
+    }
+    if (mysql_stmt_prepare(stmt, sql, std::strlen(sql)) != 0) {
+        mysql_stmt_close(stmt);
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Database error.</p>");
+        return true;
+    }
+
+    MYSQL_BIND bind[4];
+    std::memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void*)title.c_str();
+    bind[0].buffer_length = title.size();
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (void*)content.c_str();
+    bind[1].buffer_length = content.size();
+    bind[2].buffer_type = MYSQL_TYPE_STRING;
+    bind[2].buffer = (void*)category.c_str();
+    bind[2].buffer_length = category.size();
+    bind[3].buffer_type = MYSQL_TYPE_LONG;
+    bind[3].buffer = &id;
+    mysql_stmt_bind_param(stmt, bind);
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        set_html_response("500 Internal Server Error", "<h1>Error</h1><p>Failed to update article.</p>");
+        return true;
+    }
+    mysql_stmt_close(stmt);
+
+    std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+    write_buf_ =
+        "HTTP/1.1 302 Found\r\n"
+        "Location: /blog/" + std::to_string(id) + "\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: " + conn_str + "\r\n\r\n";
+    bytes_sent_ = 0;
+    last_status_ = "302 Found";
+    last_body_bytes_ = 0;
+    return true;
+}
+
+bool HttpConn::handle_blog_delete(int id) {
+    int user_id = get_session_user_id();
+    if (user_id == 0) {
+        std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+        write_buf_ =
+            "HTTP/1.1 302 Found\r\n"
+            "Location: /login\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: " + conn_str + "\r\n\r\n";
+        bytes_sent_ = 0;
+        last_status_ = "302 Found";
+        last_body_bytes_ = 0;
+        return true;
+    }
+
+    Sql_Connection_Guard guard(Sql_Connection_Pool::instance());
+    MYSQL* conn = guard.get();
+    if (conn) {
+        std::string sql_str = "DELETE FROM articles WHERE id = " + std::to_string(id);
+        mysql_query(conn, sql_str.c_str());
+    }
+
+    std::string conn_str = keep_alive_ ? "keep-alive" : "close";
+    write_buf_ =
+        "HTTP/1.1 302 Found\r\n"
+        "Location: /blog\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: " + conn_str + "\r\n\r\n";
+    bytes_sent_ = 0;
+    last_status_ = "302 Found";
+    last_body_bytes_ = 0;
+    return true;
+}
+
+bool HttpConn::handle_blog_get(const Request& req) {
+    if (req.url == "/blog") {
+        return handle_blog_list();
+    }
+    if (req.url == "/blog/new") {
+        return handle_blog_new_page();
+    }
+
+    std::string path = req.url.substr(5);  // remove "/blog"
+    if (path.empty() || path[0] != '/') {
+        set_404_response();
+        return true;
+    }
+    path = path.substr(1);  // remove leading '/'
+
+    if (path.size() > 5 && path.substr(path.size() - 5) == "/edit") {
+        std::string id_str = path.substr(0, path.size() - 5);
+        try { return handle_blog_edit_page(std::stoi(id_str)); }
+        catch (...) { set_404_response(); return true; }
+    }
+
+    // /blog/42  →  detail
+    try { return handle_blog_detail(std::stoi(path)); }
+    catch (...) { set_404_response(); return true; }
+}
+
+bool HttpConn::handle_blog_post(Request& req) {
+    if (req.url == "/blog") {
+        return handle_blog_create(req);
+    }
+
+    std::string path = req.url.substr(5);  // remove "/blog"
+    if (path.empty() || path[0] != '/') {
+        set_404_response();
+        return true;
+    }
+    path = path.substr(1);
+
+    if (path.size() > 5 && path.substr(path.size() - 5) == "/edit") {
+        std::string id_str = path.substr(0, path.size() - 5);
+        try { return handle_blog_update(std::stoi(id_str), req); }
+        catch (...) { set_404_response(); return true; }
+    }
+
+    if (path.size() > 7 && path.substr(path.size() - 7) == "/delete") {
+        std::string id_str = path.substr(0, path.size() - 7);
+        try { return handle_blog_delete(std::stoi(id_str)); }
+        catch (...) { set_404_response(); return true; }
+    }
+
+    set_404_response();
+    return true;
+}
+
 bool HttpConn::handle_get(Request& req) {
     std::cout << "[REQ] fd=" << fd_ << " url=" << req.url << " connection=" << req.connection
             << std::endl;
+
+    bool is_blog = false;
+    if (req.url == "/blog" || req.url == "/blog/new") {
+        is_blog = true;
+    } else if (req.url.find("/blog/") == 0) {
+        std::string rest = req.url.substr(6);
+        is_blog = (!rest.empty() && rest.find('.') == std::string::npos);
+    }
+    if (is_blog) {
+        return handle_blog_get(req);
+    }
 
     auto [status, body] = route(req.url);
     if (body.empty()) {
@@ -352,9 +886,9 @@ bool HttpConn::has_complete_request() const {
     size_t header_end = read_buf_.find("\r\n\r\n");
     if(header_end == std::string::npos) return false;
 
-    Request req = parse_request(read_buf_);
+    size_t content_length = extract_content_length(read_buf_, header_end);
     size_t body_start = header_end + 4;
-    size_t need = body_start + req.content_length; // GET时content_length=0
+    size_t need = body_start + content_length;
     return read_buf_.size() >= need;
 }
 
@@ -371,9 +905,9 @@ void HttpConn::reset_for_next_request() {
     size_t header_end = read_buf_.find("\r\n\r\n");
     if(header_end == std::string::npos) read_buf_.clear();
     else {
-        Request req = parse_request(read_buf_);
+        size_t content_length = extract_content_length(read_buf_, header_end);
         size_t body_start = header_end + 4;
-        size_t len = std::min(body_start + req.content_length, read_buf_.size());
+        size_t len = std::min(body_start + content_length, read_buf_.size());
 
         std::cout << "[RESET] consumed=" << len
           << " remain=" << read_buf_.size() - len << std::endl;
@@ -520,15 +1054,18 @@ Request HttpConn::parse_request(const std::string& msg) const {
 
 std::string HttpConn::make_response(const std::string& status,
                                     const std::string& type,
-                                    const std::string& body) const {
+                                    const std::string& body,
+                                    const std::string& set_cookie) const {
     const std::string conn = keep_alive_ ? "keep-alive" : "close";
     std::string res =
         "HTTP/1.1 " + status + "\r\n"
         "Content-Type: " + type + "\r\n"
         "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "Connection: " + conn + "\r\n"
-        "\r\n" +
-        body;
+        "Connection: " + conn + "\r\n";
+    if (!set_cookie.empty()) {
+        res += "Set-Cookie: " + set_cookie + "\r\n";
+    }
+    res += "\r\n" + body;
     return res;
 }
 // 简单的扩展名到 MIME 类型映射
@@ -555,15 +1092,33 @@ std::string HttpConn::get_content_type(const std::string& url) const {
     return "text/plain; charset=UTF-8";
 }
 
-// 以文本方式读取文件，失败返回空串
+// 以文本方式读取文件，失败返回空串。命中缓存时避免磁盘 I/O。
 std::string HttpConn::read_file(const std::string& filename) const {
+    // 先查缓存
+    {
+        std::lock_guard<std::mutex> lock(file_cache_mutex_);
+        auto it = file_cache_.find(filename);
+        if (it != file_cache_.end()) {
+            return it->second;
+        }
+    }
+
+    // 缓存未命中，从磁盘读取
     std::ifstream fin(filename);
     if (!fin.is_open()) {
         return "";
     }
     std::stringstream buffer;
     buffer << fin.rdbuf();
-    return buffer.str();
+    std::string content = buffer.str();
+
+    // 写入缓存供后续请求复用
+    {
+        std::lock_guard<std::mutex> lock(file_cache_mutex_);
+        file_cache_[filename] = content;
+    }
+
+    return content;
 }
 
 std::string HttpConn::get_file_path(const std::string& url) const {

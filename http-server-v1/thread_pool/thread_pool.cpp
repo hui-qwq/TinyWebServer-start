@@ -43,6 +43,7 @@ void ThreadPool::shutdown() {
         if(stopping_) return ;
         stopping_ = true;
     }
+    cv_.notify_all();
 
     for(auto& it : workers_) {
         if(it.joinable()) {
